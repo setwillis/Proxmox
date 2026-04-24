@@ -2,10 +2,9 @@
 source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/build.func)
 
 # Vaultwarden + PostgreSQL LXC
-# Runs on the Proxmox HOST — creates and configures the container,
-# then triggers the install script inside the LXC.
+# Запускается на ХОСТЕ Proxmox.
 
-APP="Vaultwarden PG"
+APP="Vaultwarden-PG"
 var_tags="${var_tags:-password-manager;postgresql}"
 var_cpu="${var_cpu:-4}"
 var_ram="${var_ram:-6144}"
@@ -31,9 +30,6 @@ function update_script() {
     exit 1
   fi
 
-  # ------------------------------------------------------------------
-  # Menu: update options
-  # ------------------------------------------------------------------
   UPD=$(whiptail --title "Vaultwarden PG Update" --menu "Choose an action:" 15 60 3 \
     "1" "Update Vaultwarden + Web-Vault" \
     "2" "Set Admin Token" \
@@ -42,9 +38,6 @@ function update_script() {
 
   case "$UPD" in
     1)
-      VW_RELEASE=$(get_latest_github_release "dani-garcia/vaultwarden")
-      WEB_RELEASE=$(get_latest_github_release "dani-garcia/bw_web_builds")
-
       msg_info "Stopping Vaultwarden"
       systemctl stop vaultwarden
       msg_ok "Stopped Vaultwarden"
@@ -56,19 +49,26 @@ function update_script() {
         postgresql-server-dev-all ca-certificates argon2
       msg_ok "Build dependencies installed"
 
-      # Ensure Rust is available (may have been installed at first install)
       ensure_profile_loaded
       if ! command -v cargo >/dev/null 2>&1; then
         msg_info "Installing Rust toolchain"
         curl https://sh.rustup.rs -sSf | sh -s -- -y >/dev/null 2>&1
+        # shellcheck disable=SC1091
         source /root/.cargo/env
         msg_ok "Rust toolchain installed"
       fi
+      # shellcheck disable=SC1091
       source /root/.cargo/env 2>/dev/null || true
+
+      VW_RELEASE=$(curl -fsSL "https://api.github.com/repos/dani-garcia/vaultwarden/releases/latest" \
+        | grep '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
+      WEB_RELEASE=$(curl -fsSL "https://api.github.com/repos/dani-garcia/bw_web_builds/releases/latest" \
+        | grep '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
 
       msg_info "Building Vaultwarden ${VW_RELEASE}"
       rm -rf /tmp/vaultwarden-src
-      fetch_and_deploy_gh_release "vaultwarden" "dani-garcia/vaultwarden" "tarball" "${VW_RELEASE}" "/tmp/vaultwarden-src"
+      curl -fsSL "https://github.com/dani-garcia/vaultwarden/archive/refs/tags/${VW_RELEASE}.tar.gz" \
+        | tar -xz -C /tmp --transform "s|^[^/]*|vaultwarden-src|"
       cd /tmp/vaultwarden-src || { msg_error "Source directory missing"; exit 1; }
       VW_VERSION="$VW_RELEASE" cargo build --features "postgresql" --release >/dev/null 2>&1
       install -m 0755 target/release/vaultwarden /usr/bin/vaultwarden
@@ -77,9 +77,12 @@ function update_script() {
       msg_ok "Updated Vaultwarden to ${VW_RELEASE}"
 
       msg_info "Updating Web-Vault to ${WEB_RELEASE}"
+      WEB_URL=$(curl -fsSL "https://api.github.com/repos/dani-garcia/bw_web_builds/releases/tags/${WEB_RELEASE}" \
+        | grep '"browser_download_url"' | grep 'bw_web_.*\.tar\.gz' | head -n1 \
+        | sed -E 's/.*"browser_download_url": *"([^"]+)".*/\1/')
       rm -rf /opt/vaultwarden/web-vault
       mkdir -p /opt/vaultwarden/web-vault
-      fetch_and_deploy_gh_release "vaultwarden_webvault" "dani-garcia/bw_web_builds" "prebuild" "${WEB_RELEASE}" "/opt/vaultwarden/web-vault" "bw_web_*.tar.gz"
+      curl -fsSL "$WEB_URL" | tar -xz -C /opt/vaultwarden/web-vault --strip-components=1
       chown -R vaultwarden:vaultwarden /opt/vaultwarden/web-vault
       msg_ok "Updated Web-Vault to ${WEB_RELEASE}"
 
@@ -109,18 +112,21 @@ function update_script() {
       grep -E '^(DOMAIN|DATABASE_URL|ROCKET_PORT|SIGNUPS_ALLOWED|ADMIN_TOKEN)=' \
         /opt/vaultwarden/.env \
         | sed 's/ADMIN_TOKEN=.*/ADMIN_TOKEN=<hidden>/' \
-        | sed 's/DATABASE_URL=postgresql:\/\/[^:]*:[^@]*@/DATABASE_URL=postgresql:\/\/<user>:<hidden>@/'
+        | sed 's|DATABASE_URL=postgresql://[^:]*:[^@]*@|DATABASE_URL=postgresql://<user>:<hidden>@|'
       ;;
   esac
   exit 0
 }
 
+# start() показывает диалог "Default / Advanced Settings"
+# В Advanced можно выбрать хранилище, сеть, CPU, RAM и т.д.
+# build_container() создаёт LXC на основе выбранных настроек.
 start
 build_container
 description
 
-# Скачиваем и запускаем install-скрипт из своего репо внутри контейнера
-msg_info "Running install script inside LXC"
+# Запускаем наш install-скрипт внутри созданного контейнера
+msg_info "Running install script inside LXC ${CTID}"
 pct exec "$CTID" -- bash -c \
   "curl -fsSL ${REPO_RAW}/install/vaultwarden-pg-install.sh | bash" \
   || { msg_error "Install script failed inside LXC ${CTID}"; exit 1; }

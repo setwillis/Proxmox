@@ -1,16 +1,59 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
 # Vaultwarden + PostgreSQL — install script
-# Executed INSIDE the LXC container by build.func after container creation.
-# Do NOT run this directly on the Proxmox host.
+# Выполняется ВНУТРИ LXC контейнера.
+# Не запускать напрямую на хосте Proxmox.
 
 source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/core.func)
+source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/tools.func)
 color; formatting; icons; load_functions; catch_errors
 
-PWGEN() { tr -dc 'A-Za-z0-9' </dev/urandom | head -c "${1:-32}"; }
+# ------------------------------------------------------------------
+# Вспомогательные функции (не зависят от tools.func)
+# ------------------------------------------------------------------
+
+PWGEN() { tr -dc 'A-Za-z0-9' </dev/urandom | head -c "${1:-32}" 2>/dev/null; echo; }
+
+# Получить последний тег релиза с GitHub API
+gh_latest_release() {
+  local repo="$1"
+  curl -fsSL "https://api.github.com/repos/${repo}/releases/latest" \
+    | grep '"tag_name"' \
+    | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/'
+}
+
+# Скачать и распаковать tarball исходников с GitHub
+gh_fetch_tarball() {
+  local repo="$1"
+  local tag="$2"
+  local dest="$3"
+  local url="https://github.com/${repo}/archive/refs/tags/${tag}.tar.gz"
+  mkdir -p "$dest"
+  curl -fsSL "$url" | tar -xz -C "$dest" --strip-components=1
+}
+
+# Скачать asset релиза по glob-паттерну
+gh_fetch_asset() {
+  local repo="$1"
+  local tag="$2"
+  local pattern="$3"
+  local dest="$4"
+  local download_url
+  download_url=$(curl -fsSL "https://api.github.com/repos/${repo}/releases/tags/${tag}" \
+    | grep '"browser_download_url"' \
+    | grep -i "${pattern//\*/.*}" \
+    | head -n1 \
+    | sed -E 's/.*"browser_download_url": *"([^"]+)".*/\1/')
+  if [[ -z "$download_url" ]]; then
+    msg_error "No asset matching '${pattern}' found in ${repo}@${tag}"
+    exit 1
+  fi
+  mkdir -p "$dest"
+  curl -fsSL "$download_url" | tar -xz -C "$dest" --strip-components=1
+}
 
 # ------------------------------------------------------------------
-# Resolve the container's own IP (used in .env and summary output)
+# Resolve the container's own IP
 # ------------------------------------------------------------------
 IP=$(hostname -I | awk '{print $1}')
 
@@ -37,7 +80,7 @@ source /root/.cargo/env 2>/dev/null || true
 msg_ok "Rust toolchain ready"
 
 # ------------------------------------------------------------------
-# 3. Service user & directory layout
+# 3. Service user & directories
 # ------------------------------------------------------------------
 msg_info "Creating service user and directories"
 id -u vaultwarden >/dev/null 2>&1 || \
@@ -57,13 +100,13 @@ PG_PASS="$(PWGEN 32)"
 $STD systemctl enable postgresql
 $STD systemctl start postgresql
 
-# Create role if it doesn't exist
+# Создать роль если не существует
 sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='${PG_USER}'" \
   | grep -q 1 \
   || sudo -u postgres psql -c \
        "CREATE USER ${PG_USER} WITH ENCRYPTED PASSWORD '${PG_PASS}';" >/dev/null 2>&1
 
-# Create database if it doesn't exist
+# Создать БД если не существует
 sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='${PG_DB}'" \
   | grep -q 1 \
   || sudo -u postgres psql -c \
@@ -72,9 +115,7 @@ sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='${PG_DB}'" \
 sudo -u postgres psql -c "ALTER DATABASE ${PG_DB} OWNER TO ${PG_USER};" >/dev/null 2>&1
 sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE ${PG_DB} TO ${PG_USER};" >/dev/null 2>&1
 
-# Allow password (TCP) authentication for the vaultwarden user.
-# Vaultwarden connects via 127.0.0.1, which uses md5/scram — not peer auth.
-# Without this line a default Debian pg_hba.conf may reject the connection.
+# Разрешить TCP-подключение для пользователя vaultwarden
 PG_HBA=$(find /etc/postgresql -name pg_hba.conf | head -n1)
 if [[ -n "$PG_HBA" ]]; then
   if ! grep -q "^host.*${PG_DB}.*${PG_USER}.*127.0.0.1" "$PG_HBA"; then
@@ -82,34 +123,29 @@ if [[ -n "$PG_HBA" ]]; then
     $STD systemctl reload postgresql
   fi
 fi
-
 msg_ok "PostgreSQL configured"
 
 # ------------------------------------------------------------------
 # 5. Web-Vault
 # ------------------------------------------------------------------
-WEB_RELEASE=$(get_latest_github_release "dani-garcia/bw_web_builds")
+WEB_RELEASE=$(gh_latest_release "dani-garcia/bw_web_builds")
 msg_info "Downloading Web-Vault ${WEB_RELEASE}"
-fetch_and_deploy_gh_release \
-  "vaultwarden_webvault" \
+gh_fetch_asset \
   "dani-garcia/bw_web_builds" \
-  "prebuild" \
   "${WEB_RELEASE}" \
-  "/opt/vaultwarden/web-vault" \
-  "bw_web_*.tar.gz"
+  "bw_web_*.tar.gz" \
+  "/opt/vaultwarden/web-vault"
 chown -R vaultwarden:vaultwarden /opt/vaultwarden/web-vault
 msg_ok "Web-Vault ${WEB_RELEASE} downloaded"
 
 # ------------------------------------------------------------------
-# 6. Build Vaultwarden from source
+# 6. Сборка Vaultwarden из исходников
 # ------------------------------------------------------------------
-VAULT_RELEASE=$(get_latest_github_release "dani-garcia/vaultwarden")
-msg_info "Building Vaultwarden ${VAULT_RELEASE} (this takes a while)"
+VAULT_RELEASE=$(gh_latest_release "dani-garcia/vaultwarden")
+msg_info "Building Vaultwarden ${VAULT_RELEASE} (занимает 10-20 минут)"
 rm -rf /tmp/vaultwarden-src
-fetch_and_deploy_gh_release \
-  "vaultwarden" \
+gh_fetch_tarball \
   "dani-garcia/vaultwarden" \
-  "tarball" \
   "${VAULT_RELEASE}" \
   "/tmp/vaultwarden-src"
 
@@ -121,10 +157,7 @@ rm -rf /tmp/vaultwarden-src
 msg_ok "Vaultwarden ${VAULT_RELEASE} built and installed"
 
 # ------------------------------------------------------------------
-# 7. Configuration file
-# NOTE: DOMAIN uses http:// because Vaultwarden itself is plain HTTP.
-#       Put a reverse proxy (Nginx, Caddy) in front for TLS.
-#       Change to https:// once you add a TLS terminator.
+# 7. Конфигурационный файл
 # ------------------------------------------------------------------
 msg_info "Writing configuration"
 ADMIN_RAW="$(PWGEN 48)"
@@ -150,7 +183,7 @@ chmod 640 /opt/vaultwarden/.env
 msg_ok "Configuration written"
 
 # ------------------------------------------------------------------
-# 8. systemd service
+# 8. systemd unit
 # ------------------------------------------------------------------
 msg_info "Creating systemd service"
 cat >/etc/systemd/system/vaultwarden.service <<'UNIT'
@@ -180,31 +213,31 @@ UNIT
 msg_ok "systemd service created"
 
 # ------------------------------------------------------------------
-# 9. Start service
+# 9. Запуск сервиса
 # ------------------------------------------------------------------
 msg_info "Starting Vaultwarden"
 systemctl daemon-reload
 $STD systemctl enable vaultwarden
 $STD systemctl restart vaultwarden
-sleep 3
+sleep 5
 
 if ! systemctl is-active --quiet vaultwarden; then
-  msg_error "Vaultwarden failed to start — check: journalctl -u vaultwarden -n 50"
+  msg_error "Vaultwarden не запустился — проверь: journalctl -u vaultwarden -n 50"
   exit 1
 fi
 msg_ok "Vaultwarden started"
 
 # ------------------------------------------------------------------
-# 10. Summary
+# 10. Итог
 # ------------------------------------------------------------------
-msg_ok "Installation complete!"
-echo -e "${CREATING}${GN}${APP:-Vaultwarden PG} setup finished successfully!${CL}"
-echo -e "${INFO}${YW} Access URL (HTTP, no TLS):${CL}"
+msg_ok "Установка завершена!"
+echo -e "${CREATING}${GN}Vaultwarden PG успешно установлен!${CL}"
+echo -e "${INFO}${YW} Адрес (HTTP, без TLS):${CL}"
 echo -e "${TAB}${GATEWAY}${BGN}http://${IP}:8000${CL}"
-echo -e "${INFO}${YW} Admin panel:${CL}"
+echo -e "${INFO}${YW} Панель администратора:${CL}"
 echo -e "${TAB}${BGN}http://${IP}:8000/admin${CL}"
-echo -e "${INFO}${YW} Admin token (SAVE THIS — shown only once):${CL}"
+echo -e "${INFO}${YW} Admin token (сохрани сейчас — больше не будет показан):${CL}"
 echo -e "${TAB}${BGN}${ADMIN_RAW}${CL}"
-echo -e "${INFO}${YW} PostgreSQL credentials are in:${CL}"
+echo -e "${INFO}${YW} Конфиг и пароль PostgreSQL:${CL}"
 echo -e "${TAB}/opt/vaultwarden/.env${CL}"
-echo -e "${INFO}${YW} To enable HTTPS, add a reverse proxy and update DOMAIN= in .env${CL}"
+echo -e "${INFO}${YW} Для HTTPS: добавь reverse proxy и смени DOMAIN= в .env${CL}"
